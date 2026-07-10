@@ -222,93 +222,88 @@ def remove_outliers(df):
     print(f"Kích thước sau khi lọc Outlier: {df_clean.shape}")
     return df_clean
 
+
 def train_housing_pipeline(data_path, model_name="Ridge"):
+    dataset = pd.read_csv(data_path)
+    dataset = remove_outliers(dataset)
 
-    with mlflow.start_run(run_name=f"CV_Pipeline_{model_name}"):
-        # 1. Đọc dữ liệu và Lọc Outlier
-        dataset = pd.read_csv(data_path)
-        dataset = remove_outliers(dataset)
+    X = dataset.drop(columns=["Order", "PID", "SalePrice"], errors="ignore")
+    y = dataset["SalePrice"]
+    y_log = np.log1p(y)
 
-        # 2. Tách X, y
-        X = dataset.drop(columns=["Order", "PID", "SalePrice"], errors="ignore")
-        y = dataset["SalePrice"]
-        y_log = np.log1p(y) # Train trên Log Price
+    X_train, X_test, y_train_log, y_test_log = train_test_split(X, y_log, test_size=0.2, random_state=42)
+    ordinal_cols = ["Exter Qual", "Exter Cond", "Bsmt Qual", "Bsmt Cond", "Heating QC",
+                    "Kitchen Qual", "Fireplace Qu", "Garage Qual", "Garage Cond", "Pool QC"]
+    qual_mapping = {"NoPool": 0, "NoFireplace": 0, "noBsmt": 0, "NoGarage": 0,
+                    "Po": 1, "Fa": 2, "TA": 3, "Gd": 4, "Ex": 5}
 
-        X_train, X_test, y_train_log, y_test_log = train_test_split(X, y_log, test_size=0.2, random_state=42)
+    target_enc_cols = ["Neighborhood", "Exterior 1st", "Exterior 2nd"]
+    all_categorical = X_train.select_dtypes(include=["object"]).columns.tolist()
+    ohe_cols = [c for c in all_categorical if c not in ordinal_cols and c not in target_enc_cols]
 
-        # 3. Phân loại các cột
-        ordinal_cols = ["Exter Qual", "Exter Cond", "Bsmt Qual", "Bsmt Cond", "Heating QC",
-                        "Kitchen Qual", "Fireplace Qu", "Garage Qual", "Garage Cond", "Pool QC"]
-        qual_mapping = {"NoPool": 0, "NoFireplace": 0, "noBsmt": 0, "NoGarage": 0,
-                        "Po": 1, "Fa": 2, "TA": 3, "Gd": 4, "Ex": 5}
+    numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+    new_features = ['Quality_Adjusted_Area', 'Total_SqFt', 'Overall_Grade',
+                    'Total_Bathrooms', 'House_Age', 'Is_Remodeled']
+    all_numeric_cols = numeric_cols + new_features
+    all_numeric_cols = [c for c in all_numeric_cols if c not in ordinal_cols]
 
-        target_enc_cols = ["Neighborhood", "Exterior 1st", "Exterior 2nd"]
-        all_categorical = X_train.select_dtypes(include=["object"]).columns.tolist()
-        ohe_cols = [c for c in all_categorical if c not in ordinal_cols and c not in target_enc_cols]
+    numeric_transformer = Pipeline(steps=[
+        ('skew_log', LogSkewedFeaturesTransformer(skew_threshold=0.75)),
+        ('scaler', StandardScaler()) 
+    ])
 
-        numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-        new_features = ['Quality_Adjusted_Area', 'Total_SqFt', 'Overall_Grade',
-                        'Total_Bathrooms', 'House_Age', 'Is_Remodeled']
-        all_numeric_cols = numeric_cols + new_features
-        all_numeric_cols = [c for c in all_numeric_cols if c not in ordinal_cols]
-
-        # 4. Định nghĩa Preprocessor (Thêm bước xử lý độ lệch cho dữ liệu số)
-        # Chúng ta gộp LogSkewedFeaturesTransformer vào nhánh xử lý số
-        numeric_transformer = Pipeline(steps=[
-            ('skew_log', LogSkewedFeaturesTransformer(skew_threshold=0.75)),
-            ('scaler', StandardScaler()) # Dịch chuyển Scaler về đây
-        ])
-
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('ordinal', CustomOrdinalEncoder(mapping_dict=qual_mapping, cols=ordinal_cols), ordinal_cols),
-                ('target_enc', OOFSmoothedTargetEncoder(m=10.0, n_splits=5), target_enc_cols),
-                ('ohe', OneHotEncoder(sparse_output=False, drop="first", handle_unknown='ignore'), ohe_cols),
-                ('numeric', numeric_transformer, all_numeric_cols)
-            ],
-            remainder='drop'
-        )
-
-        # 5. Xây dựng Pipeline riêng biệt & Lưới siêu tham số (Hyperparameter Grid)
-        if model_name == "LinearRegression":
-            model_pipeline = Pipeline(steps=[
-                # Cắt tỉa đặc trưng bằng toán học (Lasso) trước khi dùng PCA
-                ('feature_selection', SelectFromModel(Lasso(alpha=0.005, random_state=42))), 
-                ('pca', PCA(n_components=0.95, random_state=42)),
-                ('lr', LinearRegression())
-            ])
-            param_grid = {} # LinearRegression không có nhiều hyperparam để tuning
-
-        elif model_name == "Ridge":
-            model_pipeline = Pipeline(steps=[
-                ('feature_selection', SelectFromModel(Lasso(alpha=0.005, random_state=42))),
-                ('pca', PCA(n_components=0.95, random_state=42)),
-                ('ridge', Ridge())
-            ])
-            # Tinh chỉnh alpha cho Ridge
-            param_grid = {
-                'model__ridge__alpha': [0.1, 1.0, 10.0, 20.0]
-            }
-
-        elif model_name == "RandomForest":
-            model_pipeline = Pipeline(steps=[
-                ('rf', RandomForestRegressor(random_state=42, n_jobs=-1))
-            ])
-            param_grid = {
-                'model__rf__n_estimators': [100, 200],
-                'model__rf__max_depth': [None, 15, 25],
-                'model__rf__min_samples_split': [2, 5]
-            }
-
-        # Ghép nối Pipeline tổng
-        full_pipeline = Pipeline(steps=[
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('ordinal', CustomOrdinalEncoder(mapping_dict=qual_mapping, cols=ordinal_cols), ordinal_cols),
+            ('target_enc', OOFSmoothedTargetEncoder(m=10.0, n_splits=5), target_enc_cols),
+            ('ohe', OneHotEncoder(sparse_output=False, drop="first", handle_unknown='ignore'), ohe_cols),
+            ('numeric', numeric_transformer, all_numeric_cols)
+        ],
+        remainder='drop'
+    )
+    if model_name == "LinearRegression":
+        steps = [
             ('data_imputer', AmesDataImputer()),
             ('feature_engineering', AmesFeatureEngineer()),
             ('preprocessor', preprocessor),
-            ('model', model_pipeline)
-        ])
+            ('feature_selection', SelectFromModel(Lasso(alpha=0.005, random_state=42))), 
+            ('pca', PCA(n_components=0.95, random_state=42)),
+            ('lr', LinearRegression())
+        ]
+        param_grid = {} 
 
-        # 6. Huấn luyện bằng Cross-Validation (Đánh giá chéo 5-Fold)
+    elif model_name == "Ridge":
+        steps = [
+            ('data_imputer', AmesDataImputer()),
+            ('feature_engineering', AmesFeatureEngineer()),
+            ('preprocessor', preprocessor),
+            ('feature_selection', SelectFromModel(Lasso(alpha=0.005, random_state=42))),
+            ('pca', PCA(n_components=0.95, random_state=42)),
+            ('ridge', Ridge())
+        ]
+        param_grid = {'ridge__alpha': [0.1, 1.0, 10.0, 20.0]}
+
+    elif model_name == "RandomForest":
+        steps = [
+            ('data_imputer', AmesDataImputer()),
+            ('feature_engineering', AmesFeatureEngineer()),
+            ('preprocessor', preprocessor),
+            ('rf', RandomForestRegressor(random_state=42, n_jobs=-1))
+        ]
+        param_grid = {
+            'rf__n_estimators': [100, 200],
+            'rf__max_depth': [None, 15, 25],
+            'rf__min_samples_split': [2, 5]
+        }
+
+    full_pipeline = Pipeline(steps=steps)
+
+    with mlflow.start_run(run_name=f"CV_Pipeline_{model_name}"):
+        
+
+        mlflow.set_tag("model_type", model_name)
+        mlflow.set_tag("pipeline_version", "v1.0")
+
         print(f"\nĐang tinh chỉnh và huấn luyện mô hình {model_name} (5-Fold CV)...")
         grid_search = GridSearchCV(
             estimator=full_pipeline,
@@ -320,11 +315,9 @@ def train_housing_pipeline(data_path, model_name="Ridge"):
         )
         
         grid_search.fit(X_train, y_train_log)
-        
-        # Lấy ra mô hình tốt nhất từ GridSearchCV
         best_model = grid_search.best_estimator_
 
-        # 7. Dự đoán và Đánh giá trên tập Test
+        # Dự đoán đánh giá
         y_pred_log = best_model.predict(X_test)
         y_test_real = np.expm1(y_test_log)
         y_pred_real = np.expm1(y_pred_log)
@@ -335,23 +328,31 @@ def train_housing_pipeline(data_path, model_name="Ridge"):
         print(f"--- KẾT QUẢ {model_name} ---")
         print(f"Best Params: {grid_search.best_params_}")
         print(f"RMSE: ${rmse:,.2f}")
-        print(f"R2 Score: {r2:.4f} ({r2*100:.2f}%)")
+        print(f"R2 Score: {r2:.4f}")
 
-        # Log toàn bộ vào MLflow
-        mlflow.log_params(grid_search.best_params_)
+        # --- TỐI ƯU LOGGING MLFLOW ---
+        if grid_search.best_params_:
+            mlflow.log_params(grid_search.best_params_)
+        
+        mlflow.log_param("cv_splits", 5)
+        mlflow.log_param("outliers_removed", "GrLivArea > 4000 & IsoForest")
+
+        # Log Metrics
         mlflow.log_metric("test_rmse", rmse)
         mlflow.log_metric("test_r2_score", r2)
         mlflow.log_metric("best_cv_rmse_log", -grid_search.best_score_)
         
+        input_example = X_train.iloc[[0]] 
         mlflow.sklearn.log_model(
             sk_model=best_model,
             artifact_path="best_model_pipeline",
-            serialization_format="cloudpickle"
+            serialization_format="cloudpickle",
+            input_example=input_example
         )
 
         return best_model
 
-data_path = r"C:\learning\3rd year\2 semerter\machine learning\machine-learning\AmesHousing (1).csv"
+data_path = r"C:/learning/3rd year/2 semerter/machine learning/machine-learning\AmesHousing (1).csv"
 
 pipeline_lr = train_housing_pipeline(data_path, model_name="LinearRegression")
 pipeline_ridge = train_housing_pipeline(data_path, model_name="Ridge")
